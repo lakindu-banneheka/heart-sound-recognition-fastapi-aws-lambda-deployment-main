@@ -9,7 +9,7 @@ from mangum import Mangum
 app = FastAPI()
 handler = Mangum(app)
 
-MODEL_PATH = "lung_sound_classification_model.keras"
+MODEL_PATH = "models/lung_sound_classification_model.keras"
 EXPECTED_SAMPLES = 16000  # Adjust based on training configuration
 
 # Load model
