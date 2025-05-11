@@ -15,7 +15,8 @@ app = FastAPI(title="Lung Sound Classifier API")
 handler = Mangum(app)
 
 MODEL_PATH = "models/lung_sound_classification_model.keras"
-EXPECTED_SAMPLES = 48000
+EXPECTED_SAMPLES = 48000      # number of audio samples per file
+EXPECTED_FRAMES = 25         # number of time‐frames the model was trained on
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 class ErrorResponse(BaseModel):
@@ -59,16 +60,29 @@ def normalize_waveform(waveform: tf.Tensor) -> tf.Tensor:
     return waveform / (max_val + 1e-6)
 
 def extract_features_from_waveform(waveform: tf.Tensor) -> tf.Tensor:
+    """
+    Convert the 1-D waveform into a fixed-length sequence of spectral features
+    matching the model’s input: (EXPECTED_FRAMES, 1).
+    """
+    # 1. Short-time Fourier transform → [frames, freq_bins]
     spec = tf.signal.stft(waveform, frame_length=255, frame_step=128)
-    mag = tf.abs(spec)
-    features = tf.reduce_mean(mag, axis=1)
+    mag = tf.abs(spec)                          # magnitude [frames, bins]
+    features = tf.reduce_mean(mag, axis=1)      # collapse freq → [frames]
+
+    # 2. Pad or crop to EXPECTED_FRAMES
     num_frames = tf.shape(features)[0]
+
     def pad():
-        return tf.pad(features, [[0, 400 - num_frames]])
+        pad_amt = EXPECTED_FRAMES - num_frames
+        return tf.pad(features, [[0, pad_amt]])
+
     def crop():
-        return features[:400]
-    fixed = tf.cond(num_frames < 400, pad, crop)
-    return tf.reshape(fixed, (400, 1))
+        return features[:EXPECTED_FRAMES]
+
+    fixed = tf.cond(num_frames < EXPECTED_FRAMES, pad, crop)
+
+    # 3. Reshape to (EXPECTED_FRAMES, 1)
+    return tf.reshape(fixed, (EXPECTED_FRAMES, 1))
 
 @app.post(
     "/predict",
@@ -112,7 +126,7 @@ async def predict(file: UploadFile = File(...)):
     waveform = tf.squeeze(audio_tensor, axis=-1)
     waveform = normalize_waveform(waveform)
     features = extract_features_from_waveform(waveform)
-    features = tf.expand_dims(features, axis=0)  # (1,400,1)
+    features = tf.expand_dims(features, axis=0)  # → shape: (1, EXPECTED_FRAMES, 1)
 
     logits = model(features, training=False)[0]
     probs = tf.nn.softmax(logits).numpy()
