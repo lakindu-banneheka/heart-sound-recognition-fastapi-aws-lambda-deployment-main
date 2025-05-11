@@ -4,115 +4,97 @@ from pydantic import BaseModel, Field
 from mangum import Mangum
 import numpy as np
 import tensorflow as tf
-import logging
+import librosa, io, logging
 from typing import Optional
 
-# ——— Setup & Logging ———
+# ——— Setup ———
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 app = FastAPI(title="Lung Sound Classifier API")
 handler = Mangum(app)
 
 MODEL_PATH = "models/lung_sound_classification_model.keras"
-EXPECTED_SAMPLES = 16000
+EXPECTED_SAMPLE_RATE = 16000
+EXPECTED_SAMPLES = EXPECTED_SAMPLE_RATE  # 1 second of audio
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 class ErrorResponse(BaseModel):
-    code: int = Field(..., description="HTTP status code")
-    message: str = Field(..., description="Short error message")
-    details: Optional[str] = Field(None, description="Additional diagnostic info")
+    code: int
+    message: str
+    details: Optional[str] = None
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.warning(f"HTTPException: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=ErrorResponse(code=exc.status_code, message=str(exc.detail)).dict()
-    )
+async def http_exc_handler(request: Request, exc: HTTPException):
+    logger.warning(f"HTTP error: {exc.detail}")
+    return JSONResponse(exc.status_code, ErrorResponse(code=exc.status_code, message=str(exc.detail)).dict())
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception", exc_info=exc)
+async def unhandled_exc(request: Request, exc: Exception):
+    logger.error("Unhandled error", exc_info=exc)
     return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=ErrorResponse(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ErrorResponse(
             code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message="Internal server error",
             details=str(exc)
         ).dict()
     )
 
-# Load model
+# Load model once
 try:
     model = tf.keras.models.load_model(MODEL_PATH)
     logger.info("Model loaded successfully.")
 except Exception as e:
-    logger.critical(f"Model loading failed: {e}", exc_info=e)
+    logger.critical(f"Failed loading model: {e}", exc_info=e)
     model = None
 
 class_names = ["Healthy", "Unhealthy"]
 
-def normalize_waveform(waveform: tf.Tensor) -> tf.Tensor:
-    waveform = tf.cast(waveform, tf.float32)
-    max_val = tf.reduce_max(tf.abs(waveform))
-    return waveform / (max_val + 1e-6)
-
 def extract_features_from_waveform(waveform: tf.Tensor) -> tf.Tensor:
     spec = tf.signal.stft(waveform, frame_length=255, frame_step=128)
     mag = tf.abs(spec)
-    features = tf.reduce_mean(mag, axis=1)
-    num_frames = tf.shape(features)[0]
-    def pad():
-        return tf.pad(features, [[0, 400 - num_frames]])
-    def crop():
-        return features[:400]
-    fixed = tf.cond(num_frames < 400, pad, crop)
-    return tf.reshape(fixed, (400, 1))
+    feats = tf.reduce_mean(mag, axis=1)
+    # Pad or crop to 400 frames
+    n = tf.shape(feats)[0]
+    feats = tf.cond(n < 400,
+                    lambda: tf.pad(feats, [[0, 400 - n]]),
+                    lambda: feats[:400])
+    return tf.reshape(feats, (400, 1))
 
 @app.post(
     "/predict",
     responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}}
 )
 async def predict(file: UploadFile = File(...)):
-    # 1. Model available?
     if model is None:
-        raise HTTPException(status_code=503, detail="Classification model not available")
+        raise HTTPException(503, "Model not available")
 
-    # 2. Extension check
     if not file.filename.lower().endswith(".wav"):
-        raise HTTPException(status_code=400, detail="Unsupported file type; only .wav allowed")
+        raise HTTPException(400, "Only .wav files are supported")
 
-    # 3. Read contents, then size-check
     contents = await file.read()
     if not contents:
-        raise HTTPException(status_code=400, detail="Empty file")
+        raise HTTPException(400, "Empty file")
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large; must be ≤ 5 MB")
+        raise HTTPException(400, "File too large; must be ≤ 5 MB")
 
-    # 4. Decode WAV
+    # --- Resample to 16 kHz using librosa ---
     try:
-        audio_tensor, sample_rate = tf.audio.decode_wav(
-            tf.constant(contents),
-            desired_channels=1,
-            desired_samples=EXPECTED_SAMPLES
-        )
+        y, sr = librosa.load(io.BytesIO(contents), sr=EXPECTED_SAMPLE_RATE, mono=True)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode WAV: {e}")
+        raise HTTPException(400, f"Failed to read/resample audio: {e}")
 
-    # 5. Sample rate validation
-    sr = int(sample_rate.numpy())
-    if sr != 16000:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid sample rate: expected 16000 Hz, got {sr} Hz"
-        )
+    # Trim or pad to EXACTLY 1 second
+    if len(y) < EXPECTED_SAMPLES:
+        y = np.pad(y, (0, EXPECTED_SAMPLES - len(y)))
+    else:
+        y = y[:EXPECTED_SAMPLES]
 
-    # 6. Preprocess & inference
-    waveform = tf.squeeze(audio_tensor, axis=-1)
-    waveform = normalize_waveform(waveform)
+    waveform = tf.convert_to_tensor(y, dtype=tf.float32)
+
+    # --- Feature extraction & inference ---
     features = extract_features_from_waveform(waveform)
-    features = tf.expand_dims(features, axis=0)  # (1,400,1)
+    features = tf.expand_dims(features, 0)  # shape (1,400,1)
 
     logits = model(features, training=False)[0]
     probs = tf.nn.softmax(logits).numpy()

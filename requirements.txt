@@ -1,6 +1,8 @@
-fastapi
-uvicorn
-mangum
-tensorflow==2.18.0
-python-multipart
-numpy
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+mangum>=0.14.0
+tensorflow>=2.11.0
+numpy>=1.23.0
+librosa>=0.9.2
+soundfile>=0.12.1
+pydantic>=1.10.0
