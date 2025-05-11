@@ -4,3 +4,5 @@ mangum
 tensorflow==2.18.0
 python-multipart
 numpy
+librosa==0.10.0.post2 
+pydantic
