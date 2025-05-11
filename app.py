@@ -15,8 +15,8 @@ app = FastAPI(title="Lung Sound Classifier API")
 handler = Mangum(app)
 
 MODEL_PATH = "models/lung_sound_classification_model.keras"
-EXPECTED_SAMPLES = 16_000      # exactly 1 second @ 16 kHz
-EXPECTED_FRAMES = 25           # model’s time-frame count
+EXPECTED_SAMPLES = 2_000      # we want exactly 1 second @ 2 kHz
+EXPECTED_FRAMES = 25          # model was trained on 25 STFT frames
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 class ErrorResponse(BaseModel):
@@ -60,18 +60,20 @@ def normalize_waveform(waveform: tf.Tensor) -> tf.Tensor:
     return waveform / (max_val + 1e-6)
 
 def extract_features_from_waveform(waveform: tf.Tensor) -> tf.Tensor:
-    # 1) STFT → [frames, freq_bins]
+    # 1. STFT → [frames, freq_bins]
     spec = tf.signal.stft(waveform, frame_length=255, frame_step=128)
-    mag = tf.abs(spec)                             # [frames, bins]
-    features = tf.reduce_mean(mag, axis=1)         # → [frames]
-    # 2) Pad or crop to EXPECTED_FRAMES
+    mag = tf.abs(spec)                            # [frames, bins]
+    features = tf.reduce_mean(mag, axis=1)        # → [frames]
+
+    # 2. Pad or crop to EXPECTED_FRAMES
     num_frames = tf.shape(features)[0]
     def pad():
         return tf.pad(features, [[0, EXPECTED_FRAMES - num_frames]])
     def crop():
         return features[:EXPECTED_FRAMES]
     fixed = tf.cond(num_frames < EXPECTED_FRAMES, pad, crop)
-    # 3) Reshape to (EXPECTED_FRAMES, 1)
+
+    # 3. Reshape to (EXPECTED_FRAMES, 1)
     return tf.reshape(fixed, (EXPECTED_FRAMES, 1))
 
 @app.post(
@@ -79,55 +81,50 @@ def extract_features_from_waveform(waveform: tf.Tensor) -> tf.Tensor:
     responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}}
 )
 async def predict(file: UploadFile = File(...)):
-    # — model availability
     if model is None:
         raise HTTPException(status_code=503, detail="Classification model not available")
 
-    # — file validity checks
     if not file.filename.lower().endswith(".wav"):
         raise HTTPException(status_code=400, detail="Unsupported file type; only .wav allowed")
+
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large; must be ≤ 5 MB")
 
-    # — decode full-length WAV at native rate
+    # Decode *all* samples at native sample rate
     try:
         audio_tensor, sample_rate = tf.audio.decode_wav(
             tf.constant(contents),
-            desired_channels=1,
-            desired_samples=None
+            desired_channels=1,     # keep mono
+            desired_samples=None    # full length
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode WAV: {e}")
 
+    # Squeeze to shape [num_samples]
     waveform = tf.squeeze(audio_tensor, axis=-1)
     sr = int(sample_rate.numpy())
     logger.info(f"Received audio @ {sr} Hz, {waveform.shape[0]} samples")
 
-        # — resample or up/down-sample to EXPECTED_SAMPLES (16 kHz)
-    try:
-        import tensorflow_io as tfio
-        # Resample to 16 kHz
-        if sr != EXPECTED_SAMPLES:
-            logger.info(f"Resampling from {sr} Hz to {EXPECTED_SAMPLES} Hz via tensorflow-io")
-            waveform = tfio.audio.resample(waveform, rate_in=sr, rate_out=EXPECTED_SAMPLES)
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Audio resampling requires tensorflow-io; please install 'tensorflow-io'.")
+    # Resample if needed
+    if sr != 2_000:
+        logger.info(f"Resampling from {sr} → 2 000 Hz")
+        waveform = tf.signal.resample(waveform, EXPECTED_SAMPLES)
+    else:
+        # If already 2 kHz but length differs, pad/crop:
+        num_samples = tf.shape(waveform)[0]
+        def pad_samples():
+            return tf.pad(waveform, [[0, EXPECTED_SAMPLES - num_samples]])
+        def crop_samples():
+            return waveform[:EXPECTED_SAMPLES]
+        waveform = tf.cond(num_samples < EXPECTED_SAMPLES, pad_samples, crop_samples)
 
-    # Ensure exactly EXPECTED_SAMPLES length
-    num_samples = tf.shape(waveform)[0]
-    def pad_samples():
-        return tf.pad(waveform, [[0, EXPECTED_SAMPLES - num_samples]])
-    def crop_samples():
-        return waveform[:EXPECTED_SAMPLES]
-    waveform = tf.cond(num_samples < EXPECTED_SAMPLES, pad_samples, crop_samples)
-
-    # — normalize, extract features, predict
+    # Normalize, extract features, and predict
     waveform = normalize_waveform(waveform)
     features = extract_features_from_waveform(waveform)
-    features = tf.expand_dims(features, axis=0)  # → (1, EXPECTED_FRAMES, 1)
+    features = tf.expand_dims(features, axis=0)  # → (1, 25, 1)
 
     logits = model(features, training=False)[0]
     probs = tf.nn.softmax(logits).numpy()
