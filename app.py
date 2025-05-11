@@ -106,10 +106,23 @@ async def predict(file: UploadFile = File(...)):
     sr = int(sample_rate.numpy())
     logger.info(f"Received audio @ {sr} Hz, {waveform.shape[0]} samples")
 
-    # — resample or up/down-sample to EXPECTED_SAMPLES (16 kHz)
-    if sr != EXPECTED_SAMPLES:
-        logger.info(f"Resampling from {sr} Hz to {EXPECTED_SAMPLES} Hz")
-        waveform = tf.signal.resample(waveform, EXPECTED_SAMPLES)
+        # — resample or up/down-sample to EXPECTED_SAMPLES (16 kHz)
+    try:
+        import tensorflow_io as tfio
+        # Resample to 16 kHz
+        if sr != EXPECTED_SAMPLES:
+            logger.info(f"Resampling from {sr} Hz to {EXPECTED_SAMPLES} Hz via tensorflow-io")
+            waveform = tfio.audio.resample(waveform, rate_in=sr, rate_out=EXPECTED_SAMPLES)
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Audio resampling requires tensorflow-io; please install 'tensorflow-io'.")
+
+    # Ensure exactly EXPECTED_SAMPLES length
+    num_samples = tf.shape(waveform)[0]
+    def pad_samples():
+        return tf.pad(waveform, [[0, EXPECTED_SAMPLES - num_samples]])
+    def crop_samples():
+        return waveform[:EXPECTED_SAMPLES]
+    waveform = tf.cond(num_samples < EXPECTED_SAMPLES, pad_samples, crop_samples)
 
     # — normalize, extract features, predict
     waveform = normalize_waveform(waveform)
