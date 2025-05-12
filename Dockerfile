@@ -14,18 +14,20 @@
 
 FROM public.ecr.aws/lambda/python:3.9
 
-# Install system dependencies required by librosa and soundfile
-RUN yum install -y tar gzip make gcc-c++ && \
-    yum install -y libsndfile && \
+# Install system dependency for soundfile
+RUN yum -y install libsndfile && \
     yum clean all
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip3 install -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
+# Copy requirements and install
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY app.py ${LAMBDA_TASK_ROOT}
-COPY models/ ${LAMBDA_TASK_ROOT}/models/
+# Copy model to /opt/models
+COPY models/audio_model.keras /opt/models/audio_model.keras
 
-# Set the CMD to your handler
-CMD ["app.handler"]
+# Copy our FastAPI app
+COPY main.py ./
+
+# Set the Lambda handler
+# "main.handler" points to the Mangum handler in main.py
+CMD ["main.handler"]
