@@ -10,7 +10,7 @@ app = FastAPI()
 handler = Mangum(app)
 
 # Load the model once during cold start
-MODEL_PATH = "models/audio_model.keras"
+MODEL_PATH = "models/lung_sound_classification_model.keras"
 try:
     model = tf.keras.models.load_model(MODEL_PATH)
     print("Model loaded successfully.")
