@@ -1,173 +1,111 @@
-# app.py
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
 import tensorflow as tf
 import numpy as np
-import noisereduce as nr
 import os
 import io
 import tempfile
-import wave
+import librosa
+import noisereduce as nr
+import soundfile as sf
 from mangum import Mangum
 
 app = FastAPI()
-
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+handler = Mangum(app)
 
 # Global model variable
 model = None
-TARGET_FRAMES = 25  # expected time steps
-
-# Load model at startup
-def load_audio_model(model_path: str):
-    try:
-        mdl = tf.keras.models.load_model(model_path)
-        print("Model loaded successfully")
-        return mdl
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
 
 @app.on_event("startup")
-def startup_event():
+async def load_model():
     global model
-    model_path = "models/lung_sound_classification_model.keras"
-    if os.path.exists(model_path):
-        model = load_audio_model(model_path)
-    else:
-        print(f"Model file not found at {model_path}")
+    model_path = "./models/lung_sound_classification_model.keras"
+    try:
+        model = tf.keras.models.load_model(model_path)
+        print("Model loaded successfully")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise RuntimeError("Failed to load model")
 
-# Audio reading utility
-def read_wav(file_path: str) -> tuple[np.ndarray, int]:
-    with wave.open(file_path, 'rb') as wf:
-        sr = wf.getframerate()
-        frames = wf.readframes(wf.getnframes())
-        sample_width = wf.getsampwidth()
-        channels = wf.getnchannels()
+def predict_health(audio_data, sr):
+    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
+    mfccs_processed = np.mean(mfccs.T, axis=0)
+    mfccs_processed = mfccs_processed.reshape(1, -1)
 
-    # Determine dtype
-    if sample_width == 2:
-        dtype = np.int16
-    elif sample_width == 4:
-        dtype = np.int32
-    else:
-        raise ValueError(f"Unsupported sample width: {sample_width}")
-
-    audio = np.frombuffer(frames, dtype=dtype)
-    if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
-    audio = audio.astype(np.float32)
-    return audio, sr
-
-# Preprocessing to MFCC and shape matching
-import python_speech_features as psf
-
-def preprocess_audio(audio_data: np.ndarray, sr: int) -> np.ndarray:
-    mfccs = psf.mfcc(audio_data, samplerate=sr, numcep=1)
-    mfccs = mfccs  # shape: (time_steps, 1)
-    # Pad or truncate
-    if mfccs.shape[0] < TARGET_FRAMES:
-        pad_amt = TARGET_FRAMES - mfccs.shape[0]
-        mfccs = np.vstack([mfccs, np.zeros((pad_amt, mfccs.shape[1]))])
-    else:
-        mfccs = mfccs[:TARGET_FRAMES, :]
-    return mfccs.reshape(1, TARGET_FRAMES, mfccs.shape[1])
-
-# Prediction logic
-def predict_health(audio_data: np.ndarray, sr: int, model) -> tuple[str, float]:
-    input_tensor = preprocess_audio(audio_data, sr)
-    prediction = model.predict(input_tensor)
-    predicted_class = int(np.argmax(prediction, axis=1)[0])
+    prediction = model.predict(mfccs_processed)
+    predicted_class = int(np.argmax(prediction))
     confidence = float(np.max(prediction))
-    status = "Healthy" if predicted_class == 1 else "Unhealthy"
-    return status, confidence
 
-@app.get("/")
-def health_check():
-    return JSONResponse(content={"status": "Healthy"}, status_code=200)
+    return {
+        "status": "Healthy" if predicted_class == 1 else "Unhealthy",
+        "confidence": confidence
+    }
 
 @app.post("/predict")
 async def predict(audio_file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    if not audio_file.filename.lower().endswith('.wav'):
-        raise HTTPException(status_code=400, detail="Only WAV files supported")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
-            tmp.write(await audio_file.read())
-            temp_path = tmp.name
 
-        audio, sr = read_wav(temp_path)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            content = await audio_file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        new_audio, sr = librosa.load(temp_path, sr=None)
         os.remove(temp_path)
-        status, confidence = predict_health(audio, sr, model)
-        return {"status": status, "confidence": confidence}
+        return predict_health(new_audio, sr)
+
     except Exception as e:
-        if 'temp_path' in locals() and os.path.exists(temp_path):
+        if os.path.exists(temp_path):
             os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def health_check():
+    return {"status": "Healthy"}
 
 @app.post("/noise-reduction")
 async def noise_reduction(
     noise_only: UploadFile = File(...),
-    heart_noisy: UploadFile = File(...),
+    heart_noisy: UploadFile = File(...)
 ):
-    if not noise_only.filename.lower().endswith('.wav') or not heart_noisy.filename.lower().endswith('.wav'):
-        raise HTTPException(status_code=400, detail="Only WAV files supported for noise reduction")
     try:
+        # Save noise file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_noise:
-            tmp_noise.write(await noise_only.read())
+            noise_content = await noise_only.read()
+            tmp_noise.write(noise_content)
             noise_path = tmp_noise.name
+
+        # Save heart file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_heart:
-            tmp_heart.write(await heart_noisy.read())
+            heart_content = await heart_noisy.read()
+            tmp_heart.write(heart_content)
             heart_path = tmp_heart.name
 
-        noise, sr_noise = read_wav(noise_path)
-        heart, sr_heart = read_wav(heart_path)
-        if sr_noise != sr_heart:
-            raise ValueError("Sample rates do not match")
+        # Process files
+        noisy, sr = librosa.load(heart_path, sr=None)
+        noise, _ = librosa.load(noise_path, sr=sr)
+        clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr)
 
-        clean = nr.reduce_noise(y=heart, y_noise=noise, sr=sr_heart)
-
-        # Write back to WAV buffer
-        buffer = io.BytesIO()
-        with wave.open(buffer, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sr_heart)
-            data = (clean * 32767).astype(np.int16)
-            wf.writeframes(data.tobytes())
-        buffer.seek(0)
-
+        # Clean up temp files
         os.remove(noise_path)
         os.remove(heart_path)
 
-        headers = {"Content-Disposition": "attachment; filename=cleaned.wav"}
-        return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
+        # Create in-memory buffer
+        buffer = io.BytesIO()
+        sf.write(buffer, clean, sr, format='WAV')
+        buffer.seek(0)
+
+        return FileResponse(
+            buffer,
+            media_type="audio/wav",
+            filename="cleaned.wav"
+        )
+
     except Exception as e:
-        for path in (locals().get('noise_path'), locals().get('heart_path')):
+        # Cleanup if error occurs
+        for path in [noise_path, heart_path]:
             if path and os.path.exists(path):
                 os.remove(path)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-
-# AWS Lambda handler
-handler = Mangum(app)
-
-# requirements.txt
-# ----------------
-# fastapi
-# mangum
-# tensorflow
-# numpy
-# noisereduce
-# python_speech_features
-# python-multipart
-# aiofiles
-# uvicorn
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
