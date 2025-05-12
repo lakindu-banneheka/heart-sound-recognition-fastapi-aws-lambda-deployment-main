@@ -5,3 +5,5 @@ tensorflow==2.18.0
 numpy
 librosa
 python-multipart
+soundfile
+noisereduce

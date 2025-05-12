@@ -9,7 +9,7 @@ import os
 
 # --- initialize ---
 app = FastAPI()
-handler = Mangum(app)
+
 model = None  # global model
 MODEL_PATH = "models/lung_sound_classification_model.keras"
 
@@ -73,3 +73,5 @@ async def predict(audio_file: UploadFile = File(...)):
     finally:
         os.remove(tmp_path)
 
+# Lambda handler
+handler = Mangum(app)
