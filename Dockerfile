@@ -23,7 +23,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy model to /opt/models
-COPY models/audio_model.keras /opt/models/audio_model.keras
+COPY models/ /opt/models/
 
 # Copy our FastAPI app
 COPY main.py ./
