@@ -2,7 +2,8 @@ fastapi
 mangum
 tensorflow
 numpy
-librosa
+scipy
+python_speech_features
 noisereduce
 python-multipart
 aiofiles

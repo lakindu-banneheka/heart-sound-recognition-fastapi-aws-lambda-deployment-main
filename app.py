@@ -1,10 +1,10 @@
-# app.py
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
 import numpy as np
-import librosa
+import scipy.io.wavfile as wavfile
+from python_speech_features import mfcc
 import noisereduce as nr
 import os
 import io
@@ -39,7 +39,7 @@ def load_audio_model(model_path: str):
 @app.on_event("startup")
 def startup_event():
     global model
-    model_path = "lung_sound_classification_model_1.keras"
+    model_path = "models/lung_sound_classification_model.keras"
     if os.path.exists(model_path):
         model = load_audio_model(model_path)
     else:
@@ -47,15 +47,16 @@ def startup_event():
 
 # Prediction logic
 def predict_health(audio_data: np.ndarray, sr: int, model) -> tuple[str, float]:
-    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
-    mfccs_processed = np.mean(mfccs.T, axis=0).reshape(1, -1)
+    # Compute MFCCs
+    mfcc_feat = mfcc(audio_data, samplerate=sr, numcep=400)
+    mfccs_processed = np.mean(mfcc_feat, axis=0).reshape(1, -1)
     prediction = model.predict(mfccs_processed)
     predicted_class = int(np.argmax(prediction))
     confidence = float(np.max(prediction))
     status = "Healthy" if predicted_class == 1 else "Unhealthy"
     return status, confidence
 
-@app.get("/health")
+@app.get("/")
 def health_check():
     return JSONResponse(content={"status": "Healthy"}, status_code=200)
 
@@ -68,14 +69,21 @@ async def predict(audio_file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="No audio file selected")
 
     try:
+        # Save to temp file
         suffix = os.path.splitext(audio_file.filename)[1] or ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await audio_file.read())
             temp_path = tmp.name
 
-        new_audio, sr = librosa.load(temp_path, sr=None)
-        status, confidence = predict_health(new_audio, sr, model)
+        # Read WAV
+        sr, audio_int = wavfile.read(temp_path)
+        if audio_int.ndim > 1:
+            audio_int = audio_int.mean(axis=1)
+        audio = audio_int.astype(float)
         os.remove(temp_path)
+
+        # Predict
+        status, confidence = predict_health(audio, sr, model)
         return {"status": status, "confidence": confidence}
 
     except Exception as e:
@@ -100,22 +108,34 @@ async def noise_reduction(
             tmp_heart.write(await heart_noisy.read())
             heart_path = tmp_heart.name
 
-        noisy, sr = librosa.load(heart_path, sr=None)
-        noise, _ = librosa.load(noise_path, sr=sr)
-        clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr)
+        # Read WAVs
+        sr_noise, noise_int = wavfile.read(noise_path)
+        sr_heart, heart_int = wavfile.read(heart_path)
+        if sr_noise != sr_heart:
+            raise ValueError("Sample rates of noise and heart files do not match")
 
-        # Write WAV using built-in wave module
+        # Mono conversion and float
+        if heart_int.ndim > 1:
+            heart_int = heart_int.mean(axis=1)
+        if noise_int.ndim > 1:
+            noise_int = noise_int.mean(axis=1)
+        noisy = heart_int.astype(float)
+        noise = noise_int.astype(float)
+
+        # Reduce noise
+        clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr_heart)
+
+        # Write WAV via wave module
         buffer = io.BytesIO()
-        # Ensure mono and int16 format
         data = (clean * 32767).astype(np.int16)
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # 2 bytes = 16 bits
-            wf.setframerate(sr)
+            wf.setsampwidth(2)
+            wf.setframerate(sr_heart)
             wf.writeframes(data.tobytes())
         buffer.seek(0)
 
-        # Cleanup temp files
+        # Cleanup
         os.remove(noise_path)
         os.remove(heart_path)
 
@@ -123,7 +143,6 @@ async def noise_reduction(
         return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
 
     except Exception as e:
-        # Cleanup on error
         for path in (locals().get('noise_path'), locals().get('heart_path')):
             if path and os.path.exists(path):
                 os.remove(path)
@@ -131,15 +150,3 @@ async def noise_reduction(
 
 # AWS Lambda handler
 handler = Mangum(app)
-
-# requirements.txt
-# ----------------
-# fastapi
-# mangum
-# tensorflow
-# numpy
-# librosa
-# noisereduce
-# python-multipart
-# aiofiles
-# uvicorn
