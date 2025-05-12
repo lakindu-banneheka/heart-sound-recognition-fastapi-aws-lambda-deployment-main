@@ -1,10 +1,9 @@
+# app.py
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
 import numpy as np
-import scipy.io.wavfile as wavfile
-from python_speech_features import mfcc
 import noisereduce as nr
 import os
 import io
@@ -25,6 +24,7 @@ app.add_middleware(
 
 # Global model variable
 model = None
+TARGET_FRAMES = 25  # expected time steps
 
 # Load model at startup
 def load_audio_model(model_path: str):
@@ -45,13 +45,47 @@ def startup_event():
     else:
         print(f"Model file not found at {model_path}")
 
+# Audio reading utility
+def read_wav(file_path: str) -> tuple[np.ndarray, int]:
+    with wave.open(file_path, 'rb') as wf:
+        sr = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+        sample_width = wf.getsampwidth()
+        channels = wf.getnchannels()
+
+    # Determine dtype
+    if sample_width == 2:
+        dtype = np.int16
+    elif sample_width == 4:
+        dtype = np.int32
+    else:
+        raise ValueError(f"Unsupported sample width: {sample_width}")
+
+    audio = np.frombuffer(frames, dtype=dtype)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    audio = audio.astype(np.float32)
+    return audio, sr
+
+# Preprocessing to MFCC and shape matching
+import python_speech_features as psf
+
+def preprocess_audio(audio_data: np.ndarray, sr: int) -> np.ndarray:
+    mfccs = psf.mfcc(audio_data, samplerate=sr, numcep=1)
+    mfccs = mfccs  # shape: (time_steps, 1)
+    # Pad or truncate
+    if mfccs.shape[0] < TARGET_FRAMES:
+        pad_amt = TARGET_FRAMES - mfccs.shape[0]
+        mfccs = np.vstack([mfccs, np.zeros((pad_amt, mfccs.shape[1]))])
+    else:
+        mfccs = mfccs[:TARGET_FRAMES, :]
+    return mfccs.reshape(1, TARGET_FRAMES, mfccs.shape[1])
+
 # Prediction logic
 def predict_health(audio_data: np.ndarray, sr: int, model) -> tuple[str, float]:
-    # Compute MFCCs
-    mfcc_feat = mfcc(audio_data, samplerate=sr, numcep=400)
-    mfccs_processed = np.mean(mfcc_feat, axis=0).reshape(1, -1)
-    prediction = model.predict(mfccs_processed)
-    predicted_class = int(np.argmax(prediction))
+    input_tensor = preprocess_audio(audio_data, sr)
+    prediction = model.predict(input_tensor)
+    predicted_class = int(np.argmax(prediction, axis=1)[0])
     confidence = float(np.max(prediction))
     status = "Healthy" if predicted_class == 1 else "Unhealthy"
     return status, confidence
@@ -64,84 +98,59 @@ def health_check():
 async def predict(audio_file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
-    if not audio_file.filename:
-        raise HTTPException(status_code=400, detail="No audio file selected")
-
+    if not audio_file.filename.lower().endswith('.wav'):
+        raise HTTPException(status_code=400, detail="Only WAV files supported")
     try:
-        # Save to temp file
-        suffix = os.path.splitext(audio_file.filename)[1] or ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
             tmp.write(await audio_file.read())
             temp_path = tmp.name
 
-        # Read WAV
-        sr, audio_int = wavfile.read(temp_path)
-        if audio_int.ndim > 1:
-            audio_int = audio_int.mean(axis=1)
-        audio = audio_int.astype(float)
+        audio, sr = read_wav(temp_path)
         os.remove(temp_path)
-
-        # Predict
         status, confidence = predict_health(audio, sr, model)
         return {"status": status, "confidence": confidence}
-
     except Exception as e:
         if 'temp_path' in locals() and os.path.exists(temp_path):
             os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
 
 @app.post("/noise-reduction")
 async def noise_reduction(
     noise_only: UploadFile = File(...),
     heart_noisy: UploadFile = File(...),
 ):
-    if not noise_only.filename or not heart_noisy.filename:
-        raise HTTPException(status_code=400, detail="Both files must be provided and have valid names")
-
+    if not noise_only.filename.lower().endswith('.wav') or not heart_noisy.filename.lower().endswith('.wav'):
+        raise HTTPException(status_code=400, detail="Only WAV files supported for noise reduction")
     try:
-        # Save uploads
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(noise_only.filename)[1] or ".wav") as tmp_noise:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_noise:
             tmp_noise.write(await noise_only.read())
             noise_path = tmp_noise.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(heart_noisy.filename)[1] or ".wav") as tmp_heart:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_heart:
             tmp_heart.write(await heart_noisy.read())
             heart_path = tmp_heart.name
 
-        # Read WAVs
-        sr_noise, noise_int = wavfile.read(noise_path)
-        sr_heart, heart_int = wavfile.read(heart_path)
+        noise, sr_noise = read_wav(noise_path)
+        heart, sr_heart = read_wav(heart_path)
         if sr_noise != sr_heart:
-            raise ValueError("Sample rates of noise and heart files do not match")
+            raise ValueError("Sample rates do not match")
 
-        # Mono conversion and float
-        if heart_int.ndim > 1:
-            heart_int = heart_int.mean(axis=1)
-        if noise_int.ndim > 1:
-            noise_int = noise_int.mean(axis=1)
-        noisy = heart_int.astype(float)
-        noise = noise_int.astype(float)
+        clean = nr.reduce_noise(y=heart, y_noise=noise, sr=sr_heart)
 
-        # Reduce noise
-        clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr_heart)
-
-        # Write WAV via wave module
+        # Write back to WAV buffer
         buffer = io.BytesIO()
-        data = (clean * 32767).astype(np.int16)
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sr_heart)
+            data = (clean * 32767).astype(np.int16)
             wf.writeframes(data.tobytes())
         buffer.seek(0)
 
-        # Cleanup
         os.remove(noise_path)
         os.remove(heart_path)
 
         headers = {"Content-Disposition": "attachment; filename=cleaned.wav"}
         return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
-
     except Exception as e:
         for path in (locals().get('noise_path'), locals().get('heart_path')):
             if path and os.path.exists(path):
@@ -150,3 +159,15 @@ async def noise_reduction(
 
 # AWS Lambda handler
 handler = Mangum(app)
+
+# requirements.txt
+# ----------------
+# fastapi
+# mangum
+# tensorflow
+# numpy
+# noisereduce
+# python_speech_features
+# python-multipart
+# aiofiles
+# uvicorn
