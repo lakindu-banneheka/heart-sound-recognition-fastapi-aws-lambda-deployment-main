@@ -19,11 +19,10 @@ except Exception as e:
     model = None
 
 # Function to extract MFCC using TensorFlow
-def extract_mfcc(waveform: tf.Tensor, sample_rate: int, num_mfcc: int = 400) -> np.ndarray:
+def extract_mfcc(waveform: tf.Tensor, sample_rate: int, num_mfcc: int = 1, frame_count: int = 25) -> np.ndarray:
     stft = tf.signal.stft(waveform, frame_length=640, frame_step=320, fft_length=1024)
     spectrogram = tf.abs(stft)
 
-    # Convert to mel spectrogram
     num_spectrogram_bins = spectrogram.shape[-1]
     lower_edge_hertz, upper_edge_hertz, num_mel_bins = 80.0, 7600.0, 80
     linear_to_mel_weight_matrix = tf.signal.linear_to_mel_weight_matrix(
@@ -35,10 +34,16 @@ def extract_mfcc(waveform: tf.Tensor, sample_rate: int, num_mfcc: int = 400) -> 
 
     log_mel_spectrogram = tf.math.log(mel_spectrogram + 1e-6)
 
-    # Extract MFCCs
+    # Extract MFCCs: get only 1 coefficient per frame
     mfccs = tf.signal.mfccs_from_log_mel_spectrograms(log_mel_spectrogram)[..., :num_mfcc]
-    mfccs_processed = tf.reduce_mean(mfccs, axis=0).numpy()  # Shape: (num_mfcc,)
-    return mfccs_processed
+
+    # Pad or trim to exactly 25 frames
+    mfccs = mfccs[:frame_count, :]  # Trim if longer
+    padding = frame_count - tf.shape(mfccs)[0]
+    mfccs = tf.pad(mfccs, [[0, padding], [0, 0]])
+
+    return mfccs.numpy()  # shape: (25, 1)
+
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
