@@ -14,20 +14,16 @@
 
 FROM public.ecr.aws/lambda/python:3.9
 
-# Install system dependency for soundfile
-RUN yum -y install libsndfile && \
-    yum clean all
+# Install system deps
+RUN yum -y install libsndfile && yum clean all
 
-# Copy requirements and install
+# Install Python deps
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy model to /opt/models
+# Copy model & app
 COPY models/ /opt/models/
-
-# Copy our FastAPI app
 COPY main.py ./
 
-# Set the Lambda handler
-# "main.handler" points to the Mangum handler in main.py
+# Lambda entrypoint
 CMD ["main.handler"]

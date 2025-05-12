@@ -4,3 +4,4 @@ tensorflow
 librosa
 noisereduce
 soundfile
+python-multipart
