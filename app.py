@@ -60,9 +60,6 @@ async def predict(audio_file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    if audio_file.content_type != "audio/wav":
-        raise HTTPException(status_code=400, detail="Only WAV files are supported")
-
     with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
         tmp.write(await audio_file.read())
         tmp_path = tmp.name
