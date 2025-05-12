@@ -2,4 +2,4 @@ fastapi
 mangum
 uvicorn
 tensorflow==2.18.0
-
+python-multipart
