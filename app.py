@@ -9,9 +9,18 @@ import librosa
 import noisereduce as nr
 import soundfile as sf
 from mangum import Mangum
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 handler = Mangum(app)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global model variable
 model = None
