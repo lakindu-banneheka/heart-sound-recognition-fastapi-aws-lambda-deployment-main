@@ -1,167 +1,128 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from mangum import Mangum
-import numpy as np
+# app.py
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
-import logging
-from typing import Optional
-import noisereduce as nr
+import numpy as np
 import librosa
+import noisereduce as nr
 import soundfile as sf
+import os
+import io
+import tempfile
+from mangum import Mangum
 
-# ——— Setup & Logging ———
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
-app = FastAPI(title="Lung Sound Classifier API")
-handler = Mangum(app)
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-MODEL_PATH = "models/lung_sound_classification_model.keras"
-EXPECTED_SAMPLES = 2000      # number of audio samples per file
-EXPECTED_FRAMES = 25         # number of time‐frames the model was trained on
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+# Global model variable
+model = None
 
-class ErrorResponse(BaseModel):
-    code: int = Field(..., description="HTTP status code")
-    message: str = Field(..., description="Short error message")
-    details: Optional[str] = Field(None, description="Additional diagnostic info")
+# Load model at startup
+def load_audio_model(model_path: str):
+    try:
+        mdl = tf.keras.models.load_model(model_path)
+        print("Model loaded successfully")
+        return mdl
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return None
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.warning(f"HTTPException: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=ErrorResponse(code=exc.status_code, message=str(exc.detail)).dict()
-    )
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception", exc_info=exc)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=ErrorResponse(
-            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            message="Internal server error",
-            details=str(exc)
-        ).dict()
-    )
-
-# Load model
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    logger.info("Model loaded successfully.")
-except Exception as e:
-    logger.critical(f"Model loading failed: {e}", exc_info=e)
-    model = None
-
-class_names = ["Healthy", "Unhealthy"]
-
-def normalize_waveform(waveform: tf.Tensor) -> tf.Tensor:
-    waveform = tf.cast(waveform, tf.float32)
-    max_val = tf.reduce_max(tf.abs(waveform))
-    return waveform / (max_val + 1e-6)
-
-def extract_features_from_waveform(waveform: tf.Tensor) -> tf.Tensor:
-    """
-    Convert the 1-D waveform into a fixed-length sequence of spectral features
-    matching the model’s input: (EXPECTED_FRAMES, 1).
-    """
-    # 1. Short-time Fourier transform → [frames, freq_bins]
-    spec = tf.signal.stft(waveform, frame_length=255, frame_step=128)
-    mag = tf.abs(spec)                          # magnitude [frames, bins]
-    features = tf.reduce_mean(mag, axis=1)      # collapse freq → [frames]
-
-    # 2. Pad or crop to EXPECTED_FRAMES
-    num_frames = tf.shape(features)[0]
-
-    def pad():
-        pad_amt = EXPECTED_FRAMES - num_frames
-        return tf.pad(features, [[0, pad_amt]])
-
-    def crop():
-        return features[:EXPECTED_FRAMES]
-
-    fixed = tf.cond(num_frames < EXPECTED_FRAMES, pad, crop)
-
-    # 3. Reshape to (EXPECTED_FRAMES, 1)
-    return tf.reshape(fixed, (EXPECTED_FRAMES, 1))
-
-def predict_health(audio_data, sr, model):
-    # Preprocess the audio data (adjust as needed for your model)
-    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=EXPECTED_FRAMES)  # Example: MFCC features
-    mfccs_processed = np.mean(mfccs.T, axis=0)  # Example: Averaging MFCCs
-    mfccs_processed = mfccs_processed.reshape(1, -1)  # Reshape for model input
-
-    # Make a prediction
-    prediction = model.predict(mfccs_processed)
-    
-    # Assuming a binary classification (0: unhealthy, 1: healthy)
-    predicted_class = np.argmax(prediction)
-    confidence = np.max(prediction)
-
-
-    if predicted_class == 1:
-      status = "Healthy"
+@app.on_event("startup")
+def startup_event():
+    global model
+    model_path = "lung_sound_classification_model_1.keras"
+    if os.path.exists(model_path):
+        model = load_audio_model(model_path)
     else:
-      status = "Unhealthy"
+        print(f"Model file not found at {model_path}")
 
+# Prediction logic
+def predict_health(audio_data: np.ndarray, sr: int, model) -> tuple[str, float]:
+    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
+    mfccs_processed = np.mean(mfccs.T, axis=0).reshape(1, -1)
+    prediction = model.predict(mfccs_processed)
+    predicted_class = int(np.argmax(prediction))
+    confidence = float(np.max(prediction))
+    status = "Healthy" if predicted_class == 1 else "Unhealthy"
     return status, confidence
 
-@app.post(
-    "/predict",
-    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}}
-)
-async def predict(file: UploadFile = File(...)):
-    # 1. Model available?
-    if model is None:
-        raise HTTPException(status_code=503, detail="Classification model not available")
-
-    # 2. Extension check
-    if not file.filename.lower().endswith(".wav"):
-        raise HTTPException(status_code=400, detail="Unsupported file type; only .wav allowed")
-
-    # 3. Read contents, then size-check
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File too large; must be ≤ 5 MB")
-
-    # 4. Decode WAV
-    try:
-        audio_tensor, sample_rate = tf.audio.decode_wav(
-            tf.constant(contents),
-            desired_channels=1,
-            desired_samples=EXPECTED_SAMPLES
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode WAV: {e}")
-
-    # # 5. Sample rate validation
-    # sr = int(sample_rate.numpy())
-    # if sr != 2000:
-    #     raise HTTPException(
-    #         status_code=400,
-    #         detail=f"Invalid sample rate: expected 2000 Hz, got {sr} Hz"
-    #     )
-
-    # # 6. Preprocess & inference
-    # waveform = tf.squeeze(audio_tensor, axis=-1)
-    # waveform = normalize_waveform(waveform)
-    # features = extract_features_from_waveform(waveform)
-    # features = tf.expand_dims(features, axis=0)  # → shape: (1, EXPECTED_FRAMES, 1)
-
-    # logits = model(features, training=False)[0]
-    # probs = tf.nn.softmax(logits).numpy()
-    # idx = int(np.argmax(probs))
-    # label = class_names[idx]
-    # confidence = round(float(probs[idx]) * 100.0, 2)
-
-    status, confidence = predict_health(audio_tensor, sample_rate, model)
-
-    return {"predicted_class": status, "confidence_percent": confidence}
-
-@app.get("/", response_model=dict)
+@app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return JSONResponse(content={"status": "Healthy"}, status_code=200)
+
+@app.post("/predict")
+async def predict(audio_file: UploadFile = File(...)):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if not audio_file.filename:
+        raise HTTPException(status_code=400, detail="No audio file selected")
+
+    # Save to temp file
+    try:
+        suffix = os.path.splitext(audio_file.filename)[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await audio_file.read())
+            temp_path = tmp.name
+
+        # Load and predict
+        new_audio, sr = librosa.load(temp_path, sr=None)
+        status, confidence = predict_health(new_audio, sr, model)
+        os.remove(temp_path)
+        return {"status": status, "confidence": confidence}
+    except Exception as e:
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/noise-reduction")
+async def noise_reduction(
+    noise_only: UploadFile = File(...),
+    heart_noisy: UploadFile = File(...)
+):
+    if not noise_only.filename or not heart_noisy.filename:
+        raise HTTPException(status_code=400, detail="Both files must be provided and have valid names")
+
+    try:
+        # Save files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(noise_only.filename)[1] or ".wav") as tmp_noise:
+            tmp_noise.write(await noise_only.read())
+            noise_path = tmp_noise.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(heart_noisy.filename)[1] or ".wav") as tmp_heart:
+            tmp_heart.write(await heart_noisy.read())
+            heart_path = tmp_heart.name
+
+        noisy, sr = librosa.load(heart_path, sr=None)
+        noise, _ = librosa.load(noise_path, sr=sr)
+        clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr)
+
+        # Write to buffer
+        buffer = io.BytesIO()
+        sf.write(buffer, clean, sr, format='WAV')
+        buffer.seek(0)
+
+        # Cleanup
+        os.remove(noise_path)
+        os.remove(heart_path)
+
+        headers = {"Content-Disposition": "attachment; filename=cleaned.wav"}
+        return StreamingResponse(buffer, media_type="audio/wav", headers=headers)
+
+    except Exception as e:
+        # Cleanup on error
+        for path in (locals().get('noise_path'), locals().get('heart_path')):
+            if path and os.path.exists(path):
+                os.remove(path)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+
+# Lambda handler
+handler = Mangum(app)
