@@ -18,7 +18,7 @@ model = None  # global model
 @app.on_event("startup")
 def load_model():
     global model
-    model_path = os.environ.get("MODEL_PATH", "/opt/models/audio_model.keras")
+    model_path = os.environ.get("MODEL_PATH", "/opt/models/lung_sound_classification_model.keras")
     if not os.path.exists(model_path):
         raise RuntimeError(f"Model not found at {model_path}")
     model = tf.keras.models.load_model(model_path)
