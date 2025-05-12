@@ -1,33 +1,28 @@
-# FROM public.ecr.aws/lambda/python:3.9
+# Use a flexible base image with apt
+FROM python:3.9-slim
 
-# # Copy model and code
-# COPY models/ /var/task/models/
-# COPY app.py /var/task/
-# COPY requirements.txt /var/task/
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    curl \
+    && apt-get clean
 
-# # Install dependencies into /var/task
-# RUN pip3 install -r requirements.txt --target "/var/task"
+# Set workdir
+WORKDIR /var/task
 
-# # Lambda entrypoint
-# CMD ["app.handler"]
+# Install Lambda Runtime Interface Emulator (RIE)
+ADD https://github.com/aws/aws-lambda-runtime-interface-emulator/releases/latest/download/aws-lambda-rie /usr/local/bin/aws-lambda-rie
+RUN chmod +x /usr/local/bin/aws-lambda-rie
 
-
-FROM public.ecr.aws/lambda/python:3.10
-
-# Install libsndfile for soundfile/librosa
-RUN yum install -y epel-release && \
-    yum install -y libsndfile
-
-# Install Python dependencies
+# Copy files
+COPY models/ ./models/
+COPY app.py .
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy app code
-COPY . .
+# Install Python packages
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
 
-# Install Mangum for AWS Lambda compatibility
-RUN pip install mangum
-
-# Lambda entrypoint
+# Use RIE for Lambda compatibility
+ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "python", "-m", "awslambdaric"]
 CMD ["app.handler"]
-
