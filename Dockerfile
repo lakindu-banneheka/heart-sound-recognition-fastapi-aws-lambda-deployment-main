@@ -1,17 +1,12 @@
-FROM public.ecr.aws/lambda/python:3.10
+FROM public.ecr.aws/lambda/python:3.9
 
-# System dependencies (fix libsndfile issue)
-RUN yum install -y epel-release \
-    && yum install -y libsndfile
+# Copy model and code
+COPY models/ /var/task/models/
+COPY app.py /var/task/
+COPY requirements.txt /var/task/
 
-# Install pip & Python deps
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# Install dependencies into /var/task
+RUN pip3 install -r requirements.txt --target "/var/task"
 
-# Copy app code
-COPY . .
-
-# Lambda handler via Mangum
-RUN pip install mangum
-
+# Lambda entrypoint
 CMD ["app.handler"]
