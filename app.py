@@ -40,14 +40,14 @@ async def startup_event():
         print(f"Model not found at: {MODEL_PATH}")
 
 
-def predict_health(audio_data: np.ndarray, sr: int):
+def predict_health(audio_data, sr):
     mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
     mfccs_processed = np.mean(mfccs.T, axis=0).reshape(1, -1)
-    preds = model.predict(mfccs_processed)
-    cls = int(np.argmax(preds))
-    conf = float(np.max(preds))
-    status = "Healthy" if cls == 1 else "Unhealthy"
-    return {"status": status, "confidence": conf}
+    prediction = model.predict(mfccs_processed)
+    predicted_class = int(np.argmax(prediction))
+    confidence = float(np.max(prediction))
+    status = "Healthy" if predicted_class == 1 else "Unhealthy"
+    return {"status": status, "confidence": confidence}
 
 
 @app.get("/")
