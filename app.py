@@ -6,10 +6,10 @@ import tensorflow as tf
 import numpy as np
 import librosa
 import noisereduce as nr
-import soundfile as sf
 import os
 import io
 import tempfile
+import wave
 from mangum import Mangum
 
 app = FastAPI()
@@ -67,18 +67,17 @@ async def predict(audio_file: UploadFile = File(...)):
     if not audio_file.filename:
         raise HTTPException(status_code=400, detail="No audio file selected")
 
-    # Save to temp file
     try:
         suffix = os.path.splitext(audio_file.filename)[1] or ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await audio_file.read())
             temp_path = tmp.name
 
-        # Load and predict
         new_audio, sr = librosa.load(temp_path, sr=None)
         status, confidence = predict_health(new_audio, sr, model)
         os.remove(temp_path)
         return {"status": status, "confidence": confidence}
+
     except Exception as e:
         if 'temp_path' in locals() and os.path.exists(temp_path):
             os.remove(temp_path)
@@ -87,13 +86,13 @@ async def predict(audio_file: UploadFile = File(...)):
 @app.post("/noise-reduction")
 async def noise_reduction(
     noise_only: UploadFile = File(...),
-    heart_noisy: UploadFile = File(...)
+    heart_noisy: UploadFile = File(...),
 ):
     if not noise_only.filename or not heart_noisy.filename:
         raise HTTPException(status_code=400, detail="Both files must be provided and have valid names")
 
     try:
-        # Save files
+        # Save uploads
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(noise_only.filename)[1] or ".wav") as tmp_noise:
             tmp_noise.write(await noise_only.read())
             noise_path = tmp_noise.name
@@ -105,12 +104,18 @@ async def noise_reduction(
         noise, _ = librosa.load(noise_path, sr=sr)
         clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr)
 
-        # Write to buffer
+        # Write WAV using built-in wave module
         buffer = io.BytesIO()
-        sf.write(buffer, clean, sr, format='WAV')
+        # Ensure mono and int16 format
+        data = (clean * 32767).astype(np.int16)
+        with wave.open(buffer, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 2 bytes = 16 bits
+            wf.setframerate(sr)
+            wf.writeframes(data.tobytes())
         buffer.seek(0)
 
-        # Cleanup
+        # Cleanup temp files
         os.remove(noise_path)
         os.remove(heart_path)
 
@@ -124,5 +129,17 @@ async def noise_reduction(
                 os.remove(path)
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
 
-# Lambda handler
+# AWS Lambda handler
 handler = Mangum(app)
+
+# requirements.txt
+# ----------------
+# fastapi
+# mangum
+# tensorflow
+# numpy
+# librosa
+# noisereduce
+# python-multipart
+# aiofiles
+# uvicorn

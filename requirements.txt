@@ -1,10 +1,9 @@
 fastapi
-uvicorn
+mangum
 tensorflow
 numpy
 librosa
 noisereduce
-soundfile
-mangum
 python-multipart
 aiofiles
+uvicorn
