@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 mangum
-tensorflow==2.18.0
+tensorflow
 numpy
 librosa
-python-multipart
 soundfile
 noisereduce
+
+# tensorflow==2.18.0

@@ -1,25 +1,28 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from mangum import Mangum
 import tensorflow as tf
 import numpy as np
+import os
 import tempfile
 import librosa
-import os
+import soundfile as sf
+import noisereduce as nr
+from starlette.middleware.cors import CORSMiddleware
+from mangum import Mangum
 
-# --- initialize ---
 app = FastAPI()
+handler = Mangum(app)
 
-model = None  # global model
-MODEL_PATH = "models/lung_sound_classification_model.keras"
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# # load once at cold‑start
-# try:
-#     model = tf.keras.models.load_model(MODEL_PATH)
-#     print("Model loaded")
-# except Exception as e:
-#     print(f"Failed loading model: {e}")
-#     model = None
+model = None
 
 # Load model
 def load_audio_model(model_path):
@@ -34,11 +37,11 @@ def load_audio_model(model_path):
 @app.on_event("startup")
 async def startup_event():
     global model
-    if os.path.exists(MODEL_PATH):
-        model = load_audio_model(MODEL_PATH)
+    model_path = "models/lung_sound_classification_model.keras"
+    if os.path.exists(model_path):
+        model = load_audio_model(model_path)
     else:
-        print(f"Model not found at: {MODEL_PATH}")
-
+        print(f"Model not found at: {model_path}")
 
 def predict_health(audio_data, sr):
     mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
@@ -49,11 +52,9 @@ def predict_health(audio_data, sr):
     status = "Healthy" if predicted_class == 1 else "Unhealthy"
     return {"status": status, "confidence": confidence}
 
-
 @app.get("/")
-def health():
-    return {"status": "healthy"}
-
+async def health_check():
+    return {"status": "Healthy"}
 
 @app.post("/predict")
 async def predict(audio_file: UploadFile = File(...)):
@@ -72,6 +73,3 @@ async def predict(audio_file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         os.remove(tmp_path)
-
-# Lambda handler
-handler = Mangum(app)
